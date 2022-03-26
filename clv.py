@@ -1,116 +1,221 @@
+import aesara.tensor as at
 import numpy as np
+import pandas as pd
 
+from aesara.tensor import TensorVariable
 from aesara.tensor.random.op import RandomVariable
 
 import pymc as pm
-
-from pymc.distributions.distributions import Discrete
 from pymc.distributions.continuous import PositiveContinuous
+from pymc.distributions.dist_math import betaln, check_parameters
+
+import matplotlib.pyplot as plt
+import arviz as az
 
 
-class RightCensoredNegativeBinomialRV(RandomVariable):
-    name = "RightCensoredNegativeBinomial"
-    ndim_supp = 0
+class IndividualLevelCLVRV(RandomVariable):
+    name = "individual_level"
+    ndim_supp = 1
     ndims_params = [0, 0, 0, 0]
     dtype = "floatX"
-    _print_name = ("RightCensoredNegBinom", "\\{RightCensoredNegBinom}")
+    _print_name = ("IndividualLevelCLV", "\\operatorname{IndividualLevelCLV}")
+
+    def make_node(self, rng, size, dtype, lam, p, T, T0):
+
+        T = at.as_tensor_variable(T)
+        T0 = at.as_tensor_variable(T0)
+
+        # T0 and T cannot be random variables
+        if T.owner is not None:
+            raise ValueError("T must be a scalar, i.e. observed, and not random quantities.")
+
+        if T0.owner is not None:
+            raise ValueError("T0 must be a scalar, i.e. observed, and not random quantities.")
+
+        return super().make_node(rng, size, dtype, lam, p, T, T0)
+
+    def __call__(self, lam, p, T, T0=0, size=None, **kwargs):
+        return super().__call__(lam, p, T, T0, size=size, **kwargs)
+    
+    def _infer_shape(self, size, dist_params, param_shapes=None):
+        size = tuple(size)
+        
+        return size + (2,)
 
     @classmethod
-    def rng_fn(cls, rng, size, lam, p, T, T0):
-        r = rng.geometric(p=p, size=size)
-        n = rng.poisson(lam*(T - T0), size=size)
+    def rng_fn(cls, rng, lam, p, T, T0, size) -> np.array:
 
-        x = np.minimum(r, n) # elements are min(r, n)
+        if size is None:
+            size = ()
+        elif isinstance(size, int):
+            size = (size,)
+        else:
+            size = tuple(size)
+        
+        # To do: broadcast sizes
+        lam = np.array(lam)
+        p = np.array(p)
+        T = np.array(T)
+        T0 = np.array(T0)
 
-        return x
+        param_shape = np.broadcast_shapes(lam.shape, p.shape, T.shape, T0.shape)
+        size = param_shape + size
+
+        lam = np.broadcast_to(lam, size)
+        p = np.broadcast_to(p, size)
+        T = np.broadcast_to(T, size)
+        T0 = np.broadcast_to(T0, size)
+        
+        output = np.empty(shape=size + (2,))
+        
+        def sim_data(lam, p, T, T0):
+            t = 0
+            n = 0
+            
+            while True:
+                wait = rng.exponential(scale=1/lam)
+                dropout = rng.binomial(n=1, p=p)
+                
+                if t + wait > T:
+                    break
+                else:
+                    t += wait
+                    n += 1
+                    
+                    if dropout == 1:
+                        break
+            
+            return np.array(
+                [
+                    t,
+                    n,
+                ],
+            )
+        
+        for index in np.ndindex(*size):
+            output[index] = sim_data(lam[index], p[index], T[index], T0[index])
+        
+        return output
 
 
-right_censored_negative_binomial = RightCensoredNegativeBinomialRV()
-
-
-class RightCensoredNegativeBinomial(Discrete):
-    rv_op = right_censored_negative_binomial()
+individual_level_clv = IndividualLevelCLVRV()
+            
+            
+class IndividualLevelCLV(PositiveContinuous):
+    rv_op = individual_level_clv
     
     @classmethod
-    def dist(cls, lam, p, T, T0, *args, **kwargs):
-        return
-
+    def dist(cls, lam, p, T, T0, **kwargs):
+        return super().dist([lam, p, T, T0], **kwargs)
+    
     def get_moment(rv, size, lam, p, T, T0):
-        pass
-
+        if size is None:
+            size = (2,)
+        elif isinstance(size, int):
+            size = (size,) + (2,)
+        else:
+            size = tuple(size) + (2,)
+        
+        return at.full(size, at.as_tensor_variable([lam*(T - T0), 1/r*p]))
+    
     def logp(value, lam, p, T, T0):
-        active_after_x = logpow(lam * T * (1 - p), value) - lam * T - factln(value)
-        inactive_or_censored = at.log(p) + logpow(1 - p, value - 1)
-        inactive_or_censored += at.log1p(- at.cumsum())
+        t_x = value[..., 0]
+        x = value[..., 1]
+        
+        zero_observations = at.eq(x, 0)
+        
+        A = x*at.log(1 - p) + x*at.log(lam) - lam*T
+        B = at.log(p) + (x - 1)*at.log(1 - p) + x*at.log(lam) - lam*t_x
+        
+        logp = at.switch(
+            zero_observations,
+            A,
+            at.logaddexp(A, B),
+        )
+        
+        return check_parameters(
+            logp,
+            lam > 0,
+            0 <= p,
+            p <= 1,
+            at.all(T0 < T),
+            msg="lam > 0, 0 <= p <= 1, T0 < T",
+        )
 
 
-class UniformOrderStatisticRV(RandomVariable):
-    name = "UniformOrderStatistic"
-    ndim_supp = 0
-    ndims_params = [0, 0, 0, 0]
+class RandomIndividualCLVRV(RandomVariable):
+    name = "random_individual_clv"
+    ndim_supp = 1
+    ndims_params = [0, 0, 0, 0, 0, 0] # a, b, alpha, r, T, T0
     dtype = "floatX"
-    _print_name = ("")
+    _print_name = ("RandomIndividualCLV", "\\operatorname{RandomIndividualCLV}")
+    
+    def make_node(self, rng, size, dtype, a, b, r, alpha, T, T0):
+        T = at.as_tensor_variable(T)
+        T0 = at.as_tensor_variable(T0)
 
+        # T0 and T cannot be random variables
+        if T.owner is not None:
+            raise ValueError("T must be a scalar, i.e. observed, and not random quantities.")
+
+        if T0.owner is not None:
+            raise ValueError("T0 must be a scalar, i.e. observed, and not random quantities.")
+
+        return super().make_node(rng, size, dtype, a, b, r, alpha, T, T0)
+    
+    def __call__(self, a, b, r, alpha, T, T0=0, size=None, **kwargs):
+        return super().__call__(a, b, r, alpha, T, T0, size=size, **kwargs)
+    
+    def _infer_shape(self, size, dist_params, param_shapes=None):
+        size = tuple(size)
+        
+        return size + (2,)
+    
     @classmethod
-    def rng_fn(cls, rng, size, k, n, lower, upper):
-        # needs broadcasting
-        return rng.beta(k, n - k + 1, size=size)*(upper - lower) + lower
+    def rng_fn(cls, rng, a, b, r, alpha, T, T0, size):
+        p = rng.beta(a, b, size=size)
+        lam = rng.gamma(r, 1/   alpha, size=size)
+
+        return individual_level_clv.rng_fn(rng, lam, p, T, T0, size=None)
+    
+
+random_individual_clv = RandomIndividualCLVRV()
 
 
-uniform_order_statistic = UniformOrderStatisticRV()
-
-
-class UniformOrderStatistic(PositiveContinuous):
-    rv_op = uniform_order_statistic
-
+class RandomIndividualCLV(PositiveContinuous):
+    rv_op = random_individual_clv
+    
     @classmethod
-    def dist(cls, k, n, lower, upper, *args, **kwargs):
-        return super().dist([k, n, lower, upper], **kwargs)
-
-    def get_moment(rv, size, k, n, lower, upper):
-        pass
-
-    def logp(value, k, n, lower, upper):
-        pass
-
-
-class CustomerLifetimeValue:
-
-    def __init__(self, tx, frequency, r, alpha, a, b, T, T0):
-        lam = pm.Gamma(name="lam", alpha=r, beta=alpha)
-        p = pm.Beta(name="p", alpha=a, beta=b)
-
-        frequency = RightCensoredNegativeBinomial(name="frequency", lam=lam, p=p, T=T, T0=0, observed=frequency)
-        tx = UniformOrderStatistic(name="tx", k=n, n=n, lower=T0, upper=T, observed=tx)
-
-
-if __name__ == "__main__":
-
-    from lifetimes.utils import summary_data_from_transaction_data
-    from lifetimes.datasets import load_dataset
-
-    rfm = summary_data_from_transaction_data(
-        cdnow_transactions,
-        "customer_id",
-        "date",
-        observation_period_end=pd.to_datetime("1997-09-30"),
-        freq='W'
-    )
-
-    frequency = rfm["frequency"].to_numpy()
-    tx = rfm["recency"].to_numpy()
-    T = rfm["T"].to_numpy()
-
-    with pm.Model() as model:
-        # hyper priors for the Beta prior
-        r = pm.HalfNormal(name="r", sigma=10)
-        alpha = pm.HalfNormal(name="alpha", sigma=10)
-
-        # hyper priors for the Gamma prior
-        a = pm.HalfNormal(name="a", sigma=10)
-        b = pm.HalfNormal(name="b", sigma=10)
-
-        clv = CustomerLifetimeValue(tx=tx, frequency=frequency, r=r, alpha=alpha, a=a, b=b, T=T, T0=0)
-
-        prior = pm.sample_prior_predictive()
-        idata = pm.sample(samples=10000, chains=1)
+    def dist(cls, a, b, r, alpha, T, T0, **kwargs):
+        return super().dist([a, b, r, alpha, T, T0], **kwargs)
+    
+    def get_moment(rv, size, a, b, r, alpha, T, T0):
+        return at.full(size, at.as_tensor_variable([3, 3]))
+    
+    def logp(value, a, b, r, alpha, T, T0):
+        t_x = value[..., 0]
+        x = value[..., 1]
+        
+        zero_observations = at.eq(x, 0)
+        
+        A = betaln(a, b + x) - betaln(a, b) + at.gammaln(r + x) - at.gammaln(r)
+        A += r*at.log(alpha) - (r + x)*at.log(alpha + T)
+        
+        B = betaln(a + 1, b + x - 1) - betaln(a, b) + at.gammaln(r + x) - at.gammaln(r)
+        B += r*at.log(alpha) - (r + x)*at.log(alpha + t_x)
+        
+        logp = at.switch(
+            zero_observations,
+            A,
+            at.logaddexp(A, B),
+        )
+        
+        return check_parameters(
+            logp,
+            a > 0,
+            b > 0,
+            alpha > 0,
+            r > 0,
+            at.all(T0 < T),
+            msg="a, b, alpha, r > 0",
+        )
